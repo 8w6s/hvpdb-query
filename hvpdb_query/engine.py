@@ -35,10 +35,27 @@ class QueryEngine:
         
         if op == 'select':
             where = plan.get('where')
-            query = self._parse_where(where)
+            db_query, filters = self._parse_where_advanced(where)
             
-            # Execute Find
-            docs = grp.find(query)
+            # Execute Find (Push-down exact matches)
+            docs = grp.find(db_query)
+            
+            # Apply advanced filters (Post-filtering)
+            if filters:
+                filtered_docs = []
+                for d in docs:
+                    match = True
+                    for f in filters:
+                        try:
+                            if not f(d):
+                                match = False
+                                break
+                        except:
+                            match = False
+                            break
+                    if match:
+                        filtered_docs.append(d)
+                docs = filtered_docs
             
             # 1. Sorting (ORDER BY)
             order_by = plan.get('order_by')
@@ -266,34 +283,87 @@ class QueryEngine:
 
         return f"Dynamo Op '{op}' not supported."
 
-    def _parse_where(self, where_clause):
-        query = {}
-        if not where_clause:
-            return query
-            
-        # Very basic AND support: k=v AND k2=v2
-        conditions = where_clause.split(' and ') # case sensitive split for now, parser lowercased it? No.
-        # Parser didn't lowercase where clause content.
-        
-        # Try split by ' AND ' case insensitive
+    def _clean_val(self, v):
+        if v.isdigit():
+            return int(v)
+        try:
+            return float(v)
+        except ValueError:
+            pass
+        if v.startswith("'") and v.endswith("'"):
+            return v[1:-1]
+        if v.lower() == 'true':
+            return True
+        if v.lower() == 'false':
+            return False
+        if v.lower() == 'null':
+            return None
+        return v
+
+    def _parse_where_advanced(self, where_clause):
         import re
+        db_query = {}
+        filters = []
+        if not where_clause:
+            return db_query, filters
+            
         parts = re.split(r'\s+AND\s+', where_clause, flags=re.IGNORECASE)
-        
         for part in parts:
-            if '=' in part:
+            part = part.strip()
+            if not part: continue
+            
+            # >=
+            if '>=' in part:
+                k, v = [x.strip() for x in part.split('>=', 1)]
+                val = self._clean_val(v)
+                filters.append(lambda d, k=k, v=val: d.get(k) is not None and d.get(k) >= v)
+            # <=
+            elif '<=' in part:
+                k, v = [x.strip() for x in part.split('<=', 1)]
+                val = self._clean_val(v)
+                filters.append(lambda d, k=k, v=val: d.get(k) is not None and d.get(k) <= v)
+            # != or <>
+            elif '!=' in part or '<>' in part:
+                op = '!=' if '!=' in part else '<>'
+                k, v = [x.strip() for x in part.split(op, 1)]
+                val = self._clean_val(v)
+                filters.append(lambda d, k=k, v=val: d.get(k) != v)
+            # =
+            elif '=' in part:
                 k, v = [x.strip() for x in part.split('=', 1)]
-                
-                # Check for LIKE (simple * wildcard)
-                # Actually SQL uses LIKE operator, here we are inside the '=' check?
-                # Parser needs to handle operators properly.
-                # Currently parser just passes raw string.
-                
-                # Basic value cleanup
-                if v.isdigit():
-                    v = int(v)
-                elif v.startswith("'") and v.endswith("'"):
-                    v = v[1:-1]
-                
-                query[k] = v
-        
-        return query
+                val = self._clean_val(v)
+                db_query[k] = val
+            # >
+            elif '>' in part:
+                k, v = [x.strip() for x in part.split('>', 1)]
+                val = self._clean_val(v)
+                filters.append(lambda d, k=k, v=val: d.get(k) is not None and d.get(k) > v)
+            # <
+            elif '<' in part:
+                k, v = [x.strip() for x in part.split('<', 1)]
+                val = self._clean_val(v)
+                filters.append(lambda d, k=k, v=val: d.get(k) is not None and d.get(k) < v)
+            # LIKE
+            elif ' like ' in part.lower():
+                try:
+                    k, v = re.split(r'\s+like\s+', part, flags=re.IGNORECASE, maxsplit=1)
+                    k = k.strip()
+                    v = self._clean_val(v.strip())
+                    pattern = '^' + re.escape(str(v)).replace('%', '.*').replace('_', '.') + '$'
+                    filters.append(lambda d, k=k, p=pattern: d.get(k) is not None and re.match(p, str(d.get(k)), re.IGNORECASE))
+                except:
+                    pass
+            # IN
+            elif ' in ' in part.lower():
+                match = re.match(r'(\w+)\s+in\s*\((.*)\)', part, re.IGNORECASE)
+                if match:
+                    k, vals_str = match.groups()
+                    vals = [self._clean_val(x.strip()) for x in vals_str.split(',')]
+                    filters.append(lambda d, k=k, vals=vals: d.get(k) in vals)
+
+        return db_query, filters
+
+    def _parse_where(self, where_clause):
+        # Legacy wrapper
+        q, _ = self._parse_where_advanced(where_clause)
+        return q
